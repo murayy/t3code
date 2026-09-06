@@ -1,4 +1,7 @@
+// @effect-diagnostics nodeBuiltinImport:off - realpathSync.native resolves Windows 8.3 short names, which the Effect realPath does not.
+import * as NodeFS from "node:fs";
 import * as NodeServices from "@effect/platform-node/NodeServices";
+import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
 import { assert, it, describe } from "@effect/vitest";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
@@ -570,7 +573,6 @@ it.effect("backs off failed upstream refreshes across linked worktrees", () =>
       const driver = yield* makeGitVcsDriverCore().pipe(
         Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, failingFetchSpawner),
       );
-      const fileSystem = yield* FileSystem.FileSystem;
       const cwd = yield* makeTmpDir();
       const remote = yield* makeTmpDir("git-vcs-driver-remote-");
       const worktreesRoot = yield* makeTmpDir("git-vcs-driver-worktrees-");
@@ -606,9 +608,11 @@ it.effect("backs off failed upstream refreshes across linked worktrees", () =>
         "rev-parse",
         "--git-common-dir",
       ])).stdout.trim();
+      // Native realpath, since git reports the long form of a directory the
+      // temp dir may name by its 8.3 short form on Windows.
       assert.equal(
-        yield* fileSystem.realPath(pathService.resolve(cwd, rootCommonDir)),
-        yield* fileSystem.realPath(pathService.resolve(worktreePath, linkedCommonDir)),
+        NodeFS.realpathSync.native(pathService.resolve(cwd, rootCommonDir)),
+        NodeFS.realpathSync.native(pathService.resolve(worktreePath, linkedCommonDir)),
       );
       yield* Ref.set(fetchAttempts, 0);
 
@@ -1376,31 +1380,33 @@ it.layer(TestLayer)("GitVcsDriver core integration", (it) => {
   });
 
   describe("worktree operations", () => {
-    it.effect("preserves newline characters in worktree paths when listing refs", () =>
-      Effect.gen(function* () {
-        const cwd = yield* makeTmpDir();
-        yield* initRepoWithCommit(cwd);
-        const worktreesRoot = yield* makeTmpDir("git-vcs-driver-worktrees-");
-        const fileSystem = yield* FileSystem.FileSystem;
-        const pathService = yield* Path.Path;
-        const worktreePath = pathService.join(worktreesRoot, "linked\nworktree");
-        const driver = yield* GitVcsDriver.GitVcsDriver;
+    // NTFS rejects a newline in a file name, so there is nothing to preserve there.
+    it.effect.skipIf(HostProcessPlatform.defaultValue() === "win32")(
+      "preserves newline characters in worktree paths when listing refs",
+      () =>
+        Effect.gen(function* () {
+          const cwd = yield* makeTmpDir();
+          yield* initRepoWithCommit(cwd);
+          const worktreesRoot = yield* makeTmpDir("git-vcs-driver-worktrees-");
+          const pathService = yield* Path.Path;
+          const worktreePath = pathService.join(worktreesRoot, "linked\nworktree");
+          const driver = yield* GitVcsDriver.GitVcsDriver;
 
-        yield* git(cwd, ["worktree", "add", "-b", "feature/newline-path", worktreePath]);
+          yield* git(cwd, ["worktree", "add", "-b", "feature/newline-path", worktreePath]);
 
-        const refs = yield* driver.listRefs({ cwd, refresh: true });
-        const listedPath = refs.refs.find(
-          (ref) => ref.name === "feature/newline-path",
-        )?.worktreePath;
+          const refs = yield* driver.listRefs({ cwd, refresh: true });
+          const listedPath = refs.refs.find(
+            (ref) => ref.name === "feature/newline-path",
+          )?.worktreePath;
 
-        if (typeof listedPath !== "string") {
-          return assert.fail("expected the linked branch to include its worktree path");
-        }
-        assert.equal(
-          yield* fileSystem.realPath(listedPath),
-          yield* fileSystem.realPath(worktreePath),
-        );
-      }),
+          if (typeof listedPath !== "string") {
+            return assert.fail("expected the linked branch to include its worktree path");
+          }
+          assert.equal(
+            NodeFS.realpathSync.native(listedPath),
+            NodeFS.realpathSync.native(worktreePath),
+          );
+        }),
     );
 
     it.effect("checks out submodules in a new worktree", () =>
@@ -1513,6 +1519,51 @@ it.layer(TestLayer)("GitVcsDriver core integration", (it) => {
 
         yield* driver.removeWorktree({ cwd, path: worktreePath });
         const fileSystem = yield* FileSystem.FileSystem;
+        assert.equal(yield* fileSystem.exists(worktreePath), false);
+      }),
+    );
+
+    it.effect("allows worktree removal to run longer than the default command timeout", () =>
+      Effect.gen(function* () {
+        const delegate = yield* ChildProcessSpawner.ChildProcessSpawner;
+        const removalStarted = yield* Deferred.make<void>();
+        const delayedRemovalSpawner = ChildProcessSpawner.make((command) =>
+          Effect.gen(function* () {
+            if (
+              ChildProcess.isStandardCommand(command) &&
+              command.args[0] === "worktree" &&
+              command.args[1] === "remove"
+            ) {
+              yield* Deferred.succeed(removalStarted, undefined);
+              yield* Effect.sleep("31 seconds");
+            }
+            return yield* delegate.spawn(command);
+          }),
+        );
+        const driver = yield* makeGitVcsDriverCore().pipe(
+          Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, delayedRemovalSpawner),
+          Effect.provide(ServerConfigLayer),
+        );
+        const cwd = yield* makeTmpDir();
+        const { initialBranch } = yield* initRepoWithCommit(cwd);
+        const fileSystem = yield* FileSystem.FileSystem;
+        const pathService = yield* Path.Path;
+        const worktreePath = pathService.join(yield* makeTmpDir("git-worktrees-"), "slow-removal");
+
+        yield* driver.createWorktree({
+          cwd,
+          path: worktreePath,
+          refName: initialBranch,
+          newRefName: "feature/slow-removal",
+        });
+
+        const removal = yield* driver
+          .removeWorktree({ cwd, path: worktreePath, force: true })
+          .pipe(Effect.forkChild({ startImmediately: true }));
+        yield* Deferred.await(removalStarted);
+        yield* TestClock.adjust("31 seconds");
+        yield* Fiber.join(removal);
+
         assert.equal(yield* fileSystem.exists(worktreePath), false);
       }),
     );
