@@ -21,7 +21,7 @@ const defaultSqliteClientLoaders = {
   node: () => import("@t3tools/shared/nodeSqliteClient"),
 } satisfies Record<string, () => Promise<Loader>>;
 
-const makeRuntimeSqliteLayer = Effect.fn("makeRuntimeSqliteLayer")(function* (
+export const makeRuntimeSqliteLayer = Effect.fn("makeRuntimeSqliteLayer")(function* (
   config: RuntimeSqliteLayerConfig,
 ) {
   const runtime = process.versions.bun !== undefined ? "bun" : "node";
